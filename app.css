@@ -250,6 +250,7 @@ th { color: var(--text-secondary); font-weight: 600; }
 .form { display: grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; }
 @media (min-width: 640px) { .form { grid-template-columns: 1fr 1fr; } }
 .form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--text-secondary); }
+.panel h2.sep { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--grid); }
 .form-actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
 
 /* Appareils recurrents */
@@ -268,6 +269,49 @@ th { color: var(--text-secondary); font-weight: 600; }
 .hist-axe { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-muted); margin-top: 3px; }
 .app-foot { font-size: 13px; color: var(--text-secondary); margin-top: 8px; }
 .conseil { font-size: 13px; margin: 8px 0 0; padding: 8px 10px; border-radius: 10px; background: var(--surface-2); color: var(--text-primary); }
+
+/* Chargement */
+.barre-charge {
+  position: fixed; top: 0; left: 0; right: 0; height: 3px; z-index: 50; overflow: hidden;
+  opacity: 0; transition: opacity 0.2s;
+}
+.barre-charge::before {
+  content: ""; position: absolute; top: 0; bottom: 0; width: 40%; left: -40%;
+  background: var(--accent); border-radius: 2px; animation: glisse 1.1s ease-in-out infinite;
+}
+.chargement .barre-charge { opacity: 1; }
+@keyframes glisse { to { left: 100%; } }
+.periode-ligne { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.periode-ligne .periode-label { margin-top: 0; }
+.charge { display: none; align-items: center; gap: 8px; font-size: 13px; color: var(--accent); font-weight: 600; }
+.chargement .charge { display: inline-flex; }
+.spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--accent-soft); border-top-color: var(--accent); animation: tourne 0.8s linear infinite; }
+#bilan, .chart-wrap, .table-wrap { transition: opacity 0.2s, filter 0.2s; }
+.chargement #bilan, .chargement .chart-wrap, .chargement .table-wrap { opacity: 0.35; filter: grayscale(0.6); pointer-events: none; }
+.chargement .chip.on { position: relative; padding-right: 30px; }
+.chargement .chip.on::after {
+  content: ""; position: absolute; right: 10px; top: 50%; width: 12px; height: 12px; margin-top: -7px;
+  border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.35); border-top-color: var(--surface-1);
+  animation: tourne 0.8s linear infinite;
+}
+
+/* Détail d'une barre (téléphone) */
+.detail {
+  margin-top: 10px; background: var(--surface-1); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+  border-radius: var(--radius); padding: 12px 14px;
+}
+.detail-tete { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.detail-fermer {
+  font: inherit; font-size: 16px; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--border);
+  background: var(--surface-2); color: var(--text-primary); cursor: pointer; flex: none;
+}
+.detail ul { list-style: none; margin: 8px 0 0; padding: 0; }
+.detail li { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 14px; color: var(--text-secondary); }
+.detail li b { margin-left: auto; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.pastille { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.p-prod { background: var(--series-4); } .p-autres { background: var(--series-1); }
+.p-ev { background: var(--series-2); } .p-inj { background: var(--series-3); }
+.detail-pied { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--grid); font-size: 14px; }
 
 /* Messages */
 .msg { margin-top: 12px; padding: 10px 12px; border-radius: 10px; background: var(--surface-1); border: 1px solid var(--border); font-size: 14px; }

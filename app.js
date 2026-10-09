@@ -5,6 +5,8 @@
  * Reglages (prix, heures creuses) stockes dans le Shelly (cle KVS "cfg"), donc partages entre appareils.
  */
 (function () {
+  // adresse des fichiers sur GitHub Pages (pour charger historique.json)
+  var BASE_URL = ((document.currentScript && document.currentScript.src) || '').replace(/app\.js.*$/, '');
   'use strict';
 
   var VOIES = { general: 0, solaire: 1, borne: 2 };
@@ -97,8 +99,8 @@
   }
 
   // Bilans nets par tranche de 30 min : Map ts -> Wh (positif = consomme, negatif = renvoye)
-  async function getNet(id, ts, end) {
-    var P = 1800, out = new Map();
+  async function getNet(id, ts, end, periode) {
+    var P = periode || 1800, out = new Map();
     var next = Math.ceil(ts / P) * P, guard = 0;
     while (next < end && guard++ < 100) {
       var r = await rpc('EM1Data.GetNetEnergies', { id: id, ts: next, end_ts: end, period: P, add_keys: true });
@@ -121,9 +123,8 @@
   }
 
   async function intervallesMinute(ts, end) {
-    var g = await getMinutes(VOIES.general, ts, end);
-    var s = await getMinutes(VOIES.solaire, ts, end);
-    var b = await getMinutes(VOIES.borne, ts, end);
+    var r = await Promise.all([getMinutes(VOIES.general, ts, end), getMinutes(VOIES.solaire, ts, end), getMinutes(VOIES.borne, ts, end)]);
+    var g = r[0], s = r[1], b = r[2];
     var z = { imp: 0, ret: 0 };
     return union([g, s, b]).map(function (t) {
       var gg = g.get(t) || z, ss = s.get(t) || z, bb = b.get(t) || z;
@@ -141,12 +142,67 @@
     });
   }
 
+  /* ---------- Mémoire des journées (cache dans le navigateur) ----------
+   * Une journée terminée ne change plus : on la calcule une fois (par tranches de 5 min),
+   * on la range dans la mémoire du navigateur, et les fois suivantes elle s'affiche instantanément.
+   * Cette mémoire garde aussi le détail des jours au-delà des ~45 jours conservés par le Shelly. */
+  var CACHE_VER = 'v1';
+  var CHAMPS = ['achatHP', 'achatHC', 'injHP', 'injHC', 'prod', 'ond', 'ev', 'autoHP', 'autoHC', 'evAchatHP', 'evAchatHC'];
+  function signatureHC() { return (cfg.hcp || []).map(function (p) { return p[0].toFixed(2) + '-' + p[1].toFixed(2); }).join('_'); }
+  function cleCache(j) { return 'em:' + CACHE_VER + ':' + signatureHC() + ':' + j; }
+  function lireJour(j) { try { var v = localStorage.getItem(cleCache(j)); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
+  function ecrireJour(j, h) { try { localStorage.setItem(cleCache(j), JSON.stringify(h)); } catch (e) { /* mémoire pleine ou indisponible */ } }
+  function versTableau(B) { return CHAMPS.map(function (k) { return Math.round(B[k] * 10) / 10; }); }
+  function depuisTableau(B, a) { CHAMPS.forEach(function (k, i) { B[k] += a[i] || 0; }); return B; }
+
+  // Renvoie { 'AAAA-MM-JJ': [24 heures x CHAMPS] } pour les jours demandés, en n'interrogeant le Shelly que pour les jours manquants
+  async function chargerJours(jours, progres) {
+    var res = {}, manquants = [], maintenant = new Date();
+    jours.forEach(function (d) {
+      var k = ymd(d), c = addDays(d, 1) <= maintenant ? lireJour(k) : null;
+      if (c) res[k] = c; else manquants.push(d);
+    });
+    var faits = jours.length - manquants.length;
+    if (progres) progres(faits, jours.length);
+    // par paquets de 7 jours consécutifs pour afficher la progression
+    for (var i = 0; i < manquants.length; i += 7) {
+      var paquet = manquants.slice(i, i + 7);
+      var s = Math.floor(paquet[0].getTime() / 1000);
+      var e = Math.min(Math.floor(addDays(paquet[paquet.length - 1], 1).getTime() / 1000), Math.floor(Date.now() / 1000));
+      if (state.earliest && s < state.earliest) s = Math.floor(state.earliest / 300) * 300;
+      var parJour = {};
+      paquet.forEach(function (d) {
+        var l = [];
+        for (var h = 0; h < 24; h++) l.push(seau(h, h + 'h'));
+        parJour[ymd(d)] = { seaux: l, n: 0 };
+      });
+      if (s < e) {
+        var r = await Promise.all([getNet(VOIES.general, s, e, 300), getNet(VOIES.solaire, s, e, 300), getNet(VOIES.borne, s, e, 300)]);
+        union(r).forEach(function (t) {
+          var n0 = r[0].get(t) || 0, n1 = r[1].get(t) || 0, n2 = r[2].get(t) || 0, d = new Date(t * 1000), J = parJour[ymd(d)];
+          if (!J) return;
+          J.n++;
+          ajouter(J.seaux[d.getHours()], { t: t, dur: 300, achat: Math.max(0, n0), inj: Math.max(0, -n0),
+            prod: Math.max(0, n1), ond: Math.max(0, -n1), ev: Math.max(0, n2) });
+        });
+      }
+      paquet.forEach(function (d) {
+        var k = ymd(d), J = parJour[k], tab = J.seaux.map(versTableau);
+        res[k] = J.n ? tab : null;
+        if (J.n && addDays(d, 1) <= maintenant) ecrireJour(k, tab);
+      });
+      faits += paquet.length;
+      if (progres) progres(faits, jours.length);
+    }
+    return res;
+  }
+
   async function chargerArchive() {
     var out = {}, offset = 0, total = Infinity, guard = 0;
     while (offset < total && guard++ < 10) {
-      var r = await rpc('KVS.GetMany', { match: 'm*', offset: offset });
+      var r = await rpc('KVS.GetMany', { match: '*', offset: offset });
       var items = r.items || {}, n = 0;
-      var add = function (k, v) { if (/^m\d{6}$/.test(k)) { try { out[k] = JSON.parse(v); } catch (e) { } } n++; };
+      var add = function (k, v) { if (/^[mh]\d{6}$/.test(k)) { try { out[k] = JSON.parse(v); } catch (e) { } } n++; };
       if (Array.isArray(items)) items.forEach(function (it) { add(it.key, it.value); });
       else Object.keys(items).forEach(function (k) { add(k, items[k].value); });
       total = typeof r.total === 'number' ? r.total : offset + n;
@@ -158,7 +214,7 @@
 
   /* ---------- calculs ---------- */
   function seau(key, label) {
-    return { key: key, label: label, achatHP: 0, achatHC: 0, injHP: 0, injHC: 0, prod: 0, ond: 0, ev: 0, autoHP: 0, autoHC: 0, evAchatHP: 0, evAchatHC: 0, evApprox: false };
+    return { key: key, label: label, achatHP: 0, achatHC: 0, injHP: 0, injHC: 0, prod: 0, ond: 0, ev: 0, autoHP: 0, autoHC: 0, evAchatHP: 0, evAchatHC: 0, evApprox: false, hAchat: 0, hProd: 0, partiel: false };
   }
   // Part de l'intervalle [t, t + dur] situee en heures creuses (0 a 1), a la minute pres
   function partHC(t, dur) {
@@ -183,7 +239,9 @@
     B.achat = B.achatHP + B.achatHC;
     B.inj = B.injHP + B.injHC;
     B.auto = B.autoHP + B.autoHC;
-    B.maison = Math.max(0, B.achat - B.inj + B.prod - B.ond);
+    // hAchat / hProd : historique importé (avant le Shelly), où l'autoconsommation n'est pas connue :
+    // la consommation de cette partie est comptée au minimum (achats seulement)
+    B.maison = Math.max(0, (B.achat - B.hAchat) - B.inj + (B.prod - B.hProd) - B.ond) + B.hAchat;
     B.autres = Math.max(0, B.maison - B.ev);
     B.evAchat = B.evAchatHP + B.evAchatHC;
     if (prixOk()) {
@@ -197,9 +255,10 @@
   }
   function somme(list) {
     var T = seau('total', 'Total');
-    ['achatHP', 'achatHC', 'injHP', 'injHC', 'prod', 'ond', 'ev', 'autoHP', 'autoHC', 'evAchatHP', 'evAchatHC'].forEach(function (k) {
+    ['achatHP', 'achatHC', 'injHP', 'injHC', 'prod', 'ond', 'ev', 'autoHP', 'autoHC', 'evAchatHP', 'evAchatHC', 'hAchat', 'hProd'].forEach(function (k) {
       list.forEach(function (B) { T[k] += B[k]; });
     });
+    T.partiel = list.some(function (B) { return B.partiel; });
     return finir(T);
   }
 
@@ -216,6 +275,8 @@
         if (b < a) { var x = a; a = b; b = x; }
         var e = addDays(b, 1);
         if (e > now) e = now;
+        // au-delà de 2 mois : vue mois par mois (archive du Shelly), instantanée même sur 1 an ou plus
+        if ((e - a) / 86400000 > 62) return { start: new Date(a.getFullYear(), a.getMonth(), 1), end: e, gran: 'month' };
         return { start: a, end: e, gran: addDays(a, 1) >= e ? 'hour' : 'day' };
       }
     }
@@ -225,7 +286,7 @@
     if (state.period === 'today') return "Aujourd'hui, " + fmtJourLong.format(R.start);
     if (state.period === 'hier') return 'Hier, ' + fmtJourLong.format(R.start);
     if (R.gran === 'hour') return cap(fmtJourLong.format(R.start));
-    if (R.gran === 'month') return cap(fmtMoisLong.format(R.start)) + ' à ' + fmtMoisLong.format(R.end);
+    if (R.gran === 'month') return cap(fmtMoisLong.format(R.start)) + ' à ' + fmtMoisLong.format(new Date(R.end - 1));
     return 'Du ' + fmtJourCourt.format(R.start) + ' au ' + fmtJourCourt.format(new Date(R.end - 1));
   }
 
@@ -236,7 +297,9 @@
     } else if (R.gran === 'day') {
       for (var d = sod(R.start); d < R.end; d = addDays(d, 1)) list.push(seau(ymd(d), fmtJourAxe.format(d)));
     } else {
-      for (var i = 0; i < 12; i++) {
+      var nbMois = (R.end.getFullYear() * 12 + R.end.getMonth()) - (R.start.getFullYear() * 12 + R.start.getMonth()) + 1;
+      if (R.end.getDate() === 1 && R.end.getHours() === 0 && R.end.getMinutes() === 0) nbMois--;
+      for (var i = 0; i < Math.max(1, nbMois); i++) {
         var m = new Date(R.start.getFullYear(), R.start.getMonth() + i, 1);
         var b = seau('m' + m.getFullYear() + pad2(m.getMonth() + 1), fmtMois.format(m));
         b.date = m;
@@ -256,6 +319,7 @@
 
   function squelette() {
     app.innerHTML =
+      '<div class="barre-charge" aria-hidden="true"></div>' +
       '<header class="hero">' +
         '<div class="scene" id="scene"></div>' +
         '<div class="hero-content">' +
@@ -283,7 +347,8 @@
           '<label>au <input type="date" id="dTo"></label>' +
           '<button id="apply" class="btn small">Afficher</button>' +
         '</div>' +
-        '<div class="periode-label" id="periodeLabel"></div>' +
+        '<div class="periode-ligne"><div class="periode-label" id="periodeLabel"></div>' +
+        '<div class="charge" aria-live="polite"><span class="spin" aria-hidden="true"></span><span id="chargeTxt"></span></div></div>' +
       '</section>' +
       '<div id="msg" class="msg" hidden></div>' +
 
@@ -292,6 +357,7 @@
       '<section><div class="sec-head"><h2 id="chartTitle">Heure par heure</h2>' +
         '<button id="toggleTable" class="btn ghost small">Voir le tableau</button></div>' +
         '<div class="chart-wrap"><canvas id="chart" role="img" aria-label="Consommation, production et injection sur la période"></canvas></div>' +
+        '<div id="chartDetail" class="detail" hidden></div>' +
         '<div class="chart-note" id="chartNote"></div>' +
         '<div id="table" class="table-wrap" hidden></div>' +
       '</section>' +
@@ -429,22 +495,24 @@
     var autresAchat = T.achat - T.evAchat;
     var partSolAutres = T.autres > 0 ? 1 - autresAchat / T.autres : null;
     var voitures = tile('Voitures', prixOk() ? eur.format(T.coutEv) : kwh(T.ev), prixOk() ? '' : 'kWh',
-      kwh(T.ev) + ' kWh, dont ' + pct(partSolEv) + ' % solaire gratuit' +
+      kwh(T.ev) + ' kWh, dont ' + pct(partSolEv) + ' % solaire gratuit' + (T.partiel ? ' (estimé)' : '') +
       (prixOk() && T.cout > 0 ? ' · ' + pct(T.coutEv / T.cout) + ' % de l\'énergie facturée' : ''), 'voiture');
     var autres = tile('Autres appareils', prixOk() ? eur.format(T.coutAutres) : kwh(T.autres), prixOk() ? '' : 'kWh',
-      kwh(T.autres) + ' kWh, dont ' + pct(partSolAutres) + ' % solaire gratuit' +
+      kwh(T.autres) + ' kWh, dont ' + pct(partSolAutres) + ' % solaire gratuit' + (T.partiel ? ' (estimé)' : '') +
       (prixOk() && T.cout > 0 ? ' · ' + pct(T.coutAutres / T.cout) + ' % de l\'énergie facturée' : ''), 'autres');
 
+    // sur une période en partie importée, les ratios solaires ne portent que sur la partie mesurée par le Shelly
+    var prodMes = T.prod - T.hProd, maisonMes = T.maison - T.hAchat, sur = T.partiel ? ' (période mesurée par le Shelly)' : '';
     document.getElementById('bilan').innerHTML =
-      tile('Consommation totale', kwh(T.maison), 'kWh', '', '') +
-      tile('Production solaire', kwh(T.prod), 'kWh', '', 'solaire') +
-      tile('Part solaire de la conso', pct(T.maison > 0 ? T.auto / T.maison : null), '%',
-        'de ta consommation couverte par les panneaux', 'solaire') +
-      tile('Production consommée sur place', pct(T.prod > 0 ? T.auto / T.prod : null), '%',
-        'le reste part sur le réseau', 'solaire') +
+      tile('Consommation totale', (T.partiel ? '≥ ' : '') + kwh(T.maison), 'kWh', T.partiel ? 'minimum : l\'autoconsommation avant le 6 oct. n\'est pas connue' : '', '') +
+      tile('Production solaire', kwh(T.prod), 'kWh', T.partiel ? 'dont ' + kwh(T.hProd) + ' kWh relevés sur l\'onduleur' : '', 'solaire') +
+      tile('Part solaire de la conso', pct(maisonMes > 0 ? T.auto / maisonMes : null), '%',
+        'de ta consommation couverte par les panneaux' + sur, 'solaire') +
+      tile('Production consommée sur place', pct(prodMes > 0 ? T.auto / prodMes : null), '%',
+        'le reste part sur le réseau' + sur, 'solaire') +
       tile('Acheté à Octopus', kwh(T.achat), 'kWh', 'HP ' + kwh(T.achatHP) + ' · HC ' + kwh(T.achatHC) + ' kWh', 'achat') +
       tile('Injecté, donc gaspillé', kwh(T.inj), 'kWh',
-        (T.prod > 0 ? pct(T.inj / T.prod) + ' % de la production' : '') +
+        (prodMes > 0 ? pct(T.inj / prodMes) + ' % de la production' + sur : '') +
         (prixOk() && T.inj > 0 ? ', soit ' + eur.format(T.perte) + ' d\'achat évitable' : ''), 'perte') +
       facture + voitures + autres + eco;
 
@@ -478,6 +546,25 @@
     }
   };
 
+  var TACTILE = window.matchMedia && window.matchMedia('(hover: none)').matches;
+  function fermerDetail() {
+    var d = document.getElementById('chartDetail');
+    if (d) d.hidden = true;
+    if (state.chart) { state.chart.setActiveElements([]); state.chart.update('none'); }
+  }
+  function afficherDetail(list, R, i, titre) {
+    var B = list[i], d = document.getElementById('chartDetail');
+    var ligne = function (cls, lib, v) { return '<li><span class="pastille ' + cls + '"></span>' + lib + '<b>' + nf2.format(v / 1000) + ' kWh</b></li>'; };
+    d.innerHTML = '<div class="detail-tete"><b>' + titre([{ dataIndex: i }]) + '</b>' +
+      '<button class="detail-fermer" aria-label="Fermer le détail">✕</button></div><ul>' +
+      ligne('p-prod', 'Production solaire', B.prod) + ligne('p-autres', 'Autres appareils', B.autres) +
+      ligne('p-ev', 'Voitures', B.ev) + ligne('p-inj', 'Injecté (gaspillé)', B.inj) + '</ul>' +
+      (prixOk() && B.cout != null ? '<div class="detail-pied">Coût achat : <b>' + eur.format(B.cout) + '</b>' +
+        (B.coutEv > 0.005 ? ' (voitures ' + eur.format(B.coutEv) + ')' : '') + '</div>' : '');
+    d.hidden = false;
+    d.querySelector('.detail-fermer').onclick = fermerDetail;
+  }
+
   function renderChart(list, R) {
     var c = { autres: css('--series-1'), ev: css('--series-2'), inj: css('--series-3'), prod: css('--series-4'),
       surface: css('--surface-1'), texte: css('--text-secondary'), grille: css('--grid') };
@@ -506,6 +593,16 @@
     var opts = {
       responsive: true, maintainAspectRatio: false, animation: false,
       interaction: { mode: 'index', intersect: false },
+      // sur téléphone : pas d'infobulle qui reste bloquée, le détail s'affiche sous le graphique
+      events: TACTILE ? ['click'] : ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
+      onClick: function (evt, els, chart) {
+        if (!TACTILE) return;
+        var pts = chart.getElementsAtEventForMode(evt, 'index', { intersect: false }, false);
+        if (!pts.length) { fermerDetail(); return; }
+        chart.setActiveElements(pts.map(function (p) { return { datasetIndex: p.datasetIndex, index: p.index }; }));
+        chart.update('none');
+        afficherDetail(list, R, pts[0].index, titre);
+      },
       scales: {
         x: { stacked: true, grid: { display: false },
           ticks: { color: c.texte, maxRotation: 0, autoSkip: true, maxTicksLimit: R.gran === 'hour' ? 12 : 10 } },
@@ -515,7 +612,7 @@
       },
       plugins: {
         legend: { position: 'bottom', labels: { color: c.texte, usePointStyle: true, pointStyle: 'circle', boxWidth: 8, boxHeight: 8, padding: 14 } },
-        tooltip: { callbacks: {
+        tooltip: { enabled: !TACTILE, callbacks: {
           title: titre,
           label: function (ctx) { return ' ' + ctx.dataset.label + ' : ' + nf2.format(Math.abs(ctx.raw)) + ' kWh'; },
           footer: function (it) {
@@ -554,13 +651,22 @@
   }
 
   /* --- Chargement d'une periode --- */
+  function setChargement(on, txt) {
+    document.body.classList.toggle('chargement', on);
+    var el = document.getElementById('chargeTxt');
+    if (el) el.textContent = on ? (txt || 'Chargement…') : '';
+  }
+
   async function chargerPeriode() {
-    if (state.loading) return;
+    if (state.loading) { state.relancer = true; majChips(); return; } // le dernier choix sera pris en compte
     state.loading = true;
+    state.relancer = false;
     var btn = document.getElementById('refresh');
     btn.disabled = true; btn.classList.add('busy'); btn.querySelector('.lbl').textContent = 'Chargement…';
     majChips();
     message('');
+    fermerDetail();
+    setChargement(true);
     try {
       var R = plage();
       document.getElementById('periodeLabel').textContent = libellePeriode(R);
@@ -574,37 +680,51 @@
         var nb = 0;
         jours = 0; // abonnement compté seulement sur les mois enregistrés
         list.forEach(function (B) {
-          var v = arch[B.key];
-          if (!v || v.length < 9) return;
+          var v = arch[B.key], hv = arch['h' + B.key.slice(1)];
+          if (hv && hv.length >= 4) {
+            // historique importé : achats (Octopus), production (onduleur), voitures estimées
+            B.achatHP += hv[0]; B.achatHC += hv[1]; B.hAchat += hv[0] + hv[1];
+            B.prod += hv[2]; B.hProd += hv[2];
+            B.ev += hv[3]; B.evAchatHC += hv[3];
+            B.partiel = true;
+          }
+          if (!(v && v.length >= 9) && !hv) return;
           nb++;
           var finMois = new Date(B.date.getFullYear(), B.date.getMonth() + 1, 1);
           jours += (Math.min(finMois, R.end) - B.date) / 86400000;
-          B.achatHP = v[0]; B.achatHC = v[1]; B.injHP = v[2]; B.injHC = v[3];
-          B.prod = v[4]; B.ond = v[5]; B.ev = v[6]; B.autoHP = v[7]; B.autoHC = v[8];
-          if (v.length >= 11) { B.evAchatHP = v[9]; B.evAchatHC = v[10]; }
+          if (!(v && v.length >= 9)) return;
+          B.achatHP += v[0]; B.achatHC += v[1]; B.injHP += v[2]; B.injHC += v[3];
+          B.prod += v[4]; B.ond += v[5]; B.ev += v[6]; B.autoHP += v[7]; B.autoHC += v[8];
+          if (v.length >= 11) { B.evAchatHP += v[9]; B.evAchatHC += v[10]; }
           else {
             // ancien format : répartition au prorata sur le mois
             var m = Math.max(1, v[0] + v[1] - v[2] - v[3] + v[4] - v[5]), r = Math.min(1, v[6] / m);
-            B.evAchatHP = v[0] * r; B.evAchatHC = v[1] * r;
+            B.evAchatHP += v[0] * r; B.evAchatHC += v[1] * r;
           }
         });
+        if (list.some(function (B) { return B.partiel; })) note = 'Avant le 6 octobre (installation du Shelly) : achats Octopus et production de l\'onduleur importés, voitures estimées. ' +
+          'L\'injection et l\'autoconsommation de cette période ne sont pas connues : consommation, parts solaires et économies sont calculées sur la période mesurée par le Shelly.';
         if (!nb) note = "L'historique mensuel se remplit à partir de l'installation du script sur le Shelly. Reviens dans quelques heures.";
       } else {
-        var s = Math.floor(R.start.getTime() / 1000), e = Math.floor(R.end.getTime() / 1000);
-        if (state.earliest && s < state.earliest) {
-          s = state.earliest;
-          jours = Math.max(0, (R.end.getTime() / 1000 - s) / 86400);
-          note = 'Le Shelly conserve les mesures détaillées depuis le ' + fmtJourLong.format(new Date(state.earliest * 1000)) +
-            '. Pour une vue plus longue, utilise « 12 derniers mois ».';
+        var joursListe = [];
+        for (var d = sod(R.start); d < R.end; d = addDays(d, 1)) joursListe.push(d);
+        var data = await chargerJours(joursListe, function (f, t) {
+          if (t > 1 && f < t) setChargement(true, 'Lecture des mesures : ' + f + ' / ' + t + ' jours…');
+        });
+        var avec = 0, premier = null;
+        joursListe.forEach(function (d) {
+          var k = ymd(d), tab = data[k];
+          if (!tab) return;
+          avec++;
+          if (!premier) premier = d;
+          if (R.gran === 'hour') tab.forEach(function (a, h) { depuisTableau(list[h], a); });
+          else tab.forEach(function (a) { depuisTableau(map[k], a); });
+        });
+        if (!avec) note = 'Aucune donnée enregistrée sur cette période.';
+        else if (premier > sod(R.start)) {
+          jours = Math.max(0, (R.end - premier) / 86400000);
+          note = 'Pas de mesures avant le ' + fmtJourLong.format(premier) + ' sur cet appareil. Pour une vue plus longue, utilise « 12 derniers mois ».';
         }
-        if (s < e) {
-          var ivs = R.gran === 'hour' ? await intervallesMinute(s, e) : await intervallesNet(s, e);
-          ivs.forEach(function (iv) {
-            var B = map[cle(R.gran, new Date(iv.t * 1000))];
-            if (B) ajouter(B, iv);
-          });
-          if (!ivs.length) note = 'Aucune donnée enregistrée sur cette période.';
-        } else if (!note) note = 'Aucune donnée enregistrée sur cette période.';
       }
 
       list.forEach(finir);
@@ -613,16 +733,17 @@
       renderChart(list, R);
       renderTable(list, R);
       if (note) message(note, 'info');
-      document.getElementById('foot').textContent = R.gran === 'hour'
-        ? 'Calcul minute par minute à partir du Shelly Pro 3EM.'
-        : R.gran === 'day' ? 'Sur plusieurs jours, calcul par tranches de 30 minutes : estimation à quelques % près.'
-        : 'Vue mensuelle : cumuls enregistrés toutes les 5 minutes par le script du Shelly.';
+      document.getElementById('foot').textContent = R.gran === 'month'
+        ? 'Vue mensuelle : cumuls enregistrés toutes les 5 minutes par le script du Shelly.'
+        : 'Calcul par tranches de 5 minutes à partir du Shelly Pro 3EM. Les journées terminées sont gardées en mémoire sur cet appareil pour un affichage instantané.';
       document.getElementById('maj').textContent = 'Mis à jour à ' + fmtHeure.format(new Date());
     } catch (err) {
       message("Impossible de lire le Shelly (" + err.message + "). Vérifie que tu es bien sur le WiFi de la maison.", 'err');
     } finally {
       state.loading = false;
+      setChargement(false);
       btn.disabled = false; btn.classList.remove('busy'); btn.querySelector('.lbl').textContent = 'Actualiser';
+      if (state.relancer) chargerPeriode();
     }
   }
 
@@ -650,8 +771,23 @@
         '<label>Abonnement (€ par mois)<input id="fAB" inputmode="decimal" placeholder="facultatif" value="' + (cfg.ab != null ? String(cfg.ab).replace('.', ',') : '') + '"></label>' +
         '<label>Plages heures creuses<input id="fHCP" placeholder="ex. 22:00-06:00 ou 01:30-07:30, 12:30-14:30" value="' + plages + '"></label>' +
       '</div>' +
-      '<div class="form-actions"><button id="fSave" class="btn">Enregistrer</button><button id="fCancel" class="btn ghost">Fermer</button><span id="fMsg" class="tile-note"></span></div>';
+      '<div class="form-actions"><button id="fSave" class="btn">Enregistrer</button><button id="fCancel" class="btn ghost">Fermer</button><span id="fMsg" class="tile-note"></span></div>' +
+      '<h2 class="sep">Journal annuel (Google Sheets)</h2>' +
+      '<p class="tile-note">Le Shelly envoie une ligne toutes les 30 minutes dans ton Google Sheet. C\'est la base de l\'analyse sur un an (batterie, panneaux, forfait, revente).</p>' +
+      '<div class="form">' +
+        '<label>Adresse du script Google (se termine par /exec)<input id="jURL" placeholder="https://script.google.com/macros/s/…/exec"></label>' +
+        '<label>Code secret<input id="jKEY" placeholder="le même que dans le script Google"></label>' +
+      '</div>' +
+      '<div class="form-actions"><button id="jSave" class="btn">Enregistrer le journal</button>' +
+        '<button id="jHisto" class="btn ghost">Envoyer l\'historique</button><span id="jMsg" class="tile-note"></span></div>' +
+      '<p class="tile-note" id="jStat"></p>' +
+      '<h2 class="sep">Historique avant le Shelly</h2>' +
+      '<p class="tile-note">Juillet → 6 octobre : achats jour par jour (Octopus), production par mois (onduleur), recharges des voitures estimées. ' +
+        'Visible dans « 12 derniers mois ». Envoyé aussi dans l\'onglet « Avant Shelly » du Google Sheet si le journal est configuré.</p>' +
+      '<div class="form-actions"><button id="hImport" class="btn ghost">Importer juillet → 6 octobre</button><span id="hMsg" class="tile-note"></span></div>';
     p.hidden = false;
+    document.getElementById('hImport').onclick = importerHistorique;
+    initJournal();
     document.getElementById('fCancel').onclick = function () { p.hidden = true; };
     document.getElementById('fSave').onclick = async function () {
       var hcp = parsePlages(document.getElementById('fHCP').value);
@@ -666,6 +802,87 @@
         chargerLive(); chargerPeriode();
       } catch (e) { m.textContent = 'Erreur : ' + e.message; }
     };
+  }
+
+  /* ---------- Journal annuel Google Sheets ---------- */
+  async function lireKVS(cle) { try { var r = await rpc('KVS.Get', { key: cle }); return r.value; } catch (e) { return null; } }
+
+  async function initJournal() {
+    var j = null, st = await lireKVS('jstat');
+    try { j = JSON.parse(await lireKVS('journal')); } catch (e) { j = null; }
+    if (j) { document.getElementById('jURL').value = j.u || ''; document.getElementById('jKEY').value = j.k || ''; }
+    document.getElementById('jStat').textContent = !j ? 'Journal pas encore configuré.'
+      : st ? 'Dernière demi-heure envoyée par le Shelly : ' + st + '.' : 'Configuré. Le premier envoi du Shelly arrive dans les 30 minutes.';
+    document.getElementById('jSave').onclick = async function () {
+      var u = document.getElementById('jURL').value.trim(), k = document.getElementById('jKEY').value.trim(), m = document.getElementById('jMsg');
+      if (!/^https:\/\/script\.google\.com\/.+\/exec$/.test(u) || !k) { m.textContent = 'Adresse ou code secret invalide.'; return; }
+      try { await rpc('KVS.Set', { key: 'journal', value: JSON.stringify({ u: u, k: k }) }); m.textContent = 'Enregistré ✓';
+        document.getElementById('jStat').textContent = 'Configuré. Le Shelly enverra sa première ligne dans les 30 minutes.'; }
+      catch (e) { m.textContent = 'Erreur : ' + e.message; }
+    };
+    document.getElementById('jHisto').onclick = envoyerHistorique;
+  }
+
+  // Envoie au Google Sheet tout l'historique encore conservé par le Shelly (demi-heures terminées)
+  async function envoyerHistorique() {
+    var m = document.getElementById('jMsg'), b = document.getElementById('jHisto');
+    var u = document.getElementById('jURL').value.trim(), k = document.getElementById('jKEY').value.trim();
+    if (!u || !k) { m.textContent = 'Renseigne et enregistre d\'abord l\'adresse et le code.'; return; }
+    b.disabled = true;
+    try {
+      var debut = state.earliest ? Math.ceil(state.earliest / 1800) * 1800 : Math.floor(Date.now() / 1000) - 45 * 86400;
+      var fin = Math.floor(Date.now() / 1000 / 1800) * 1800, lignes = {};
+      for (var t = debut; t < fin; t += 7 * 86400) {
+        var e = Math.min(fin, t + 7 * 86400);
+        m.textContent = 'Lecture du Shelly : ' + new Date(t * 1000).toLocaleDateString('fr-FR') + '…';
+        var r = await Promise.all([getNet(VOIES.general, t, e, 300), getNet(VOIES.solaire, t, e, 300), getNet(VOIES.borne, t, e, 300)]);
+        union(r).forEach(function (ts) {
+          var n0 = r[0].get(ts) || 0, n1 = r[1].get(ts) || 0, n2 = r[2].get(ts) || 0;
+          var slot = Math.floor(ts / 1800) * 1800, d = new Date(slot * 1000);
+          var cle = ymd(d) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+          var L = lignes[cle] || (lignes[cle] = [cle, 0, 0, 0, 0, 0, 0, isHC(hourFrac(d)) ? 1 : 0]);
+          var prod = Math.max(0, n1), inj = Math.max(0, -n0);
+          L[1] += Math.max(0, n0); L[2] += inj; L[3] += prod; L[4] += Math.max(0, -n1); L[5] += Math.max(0, n2);
+          L[6] += Math.max(0, prod - inj);
+        });
+      }
+      var tab = Object.keys(lignes).sort().map(function (c) {
+        return lignes[c].map(function (v, i) { return i === 0 || i === 7 ? v : Math.round(v * 10) / 10; });
+      });
+      for (var i = 0; i < tab.length; i += 300) {
+        m.textContent = 'Envoi au Google Sheet : ' + Math.min(i + 300, tab.length) + ' / ' + tab.length + ' demi-heures…';
+        await fetch(u, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({ token: k, source: 'historique', rows: tab.slice(i, i + 300) }) });
+      }
+      m.textContent = tab.length + ' demi-heures envoyées ✓ Vérifie l\'onglet « Journal » du Google Sheet.';
+    } catch (err) { m.textContent = 'Erreur : ' + err.message; }
+    finally { b.disabled = false; }
+  }
+
+  // Historique d'avant le Shelly : fichier historique.json publié à côté de app.js sur GitHub
+  async function importerHistorique() {
+    var m = document.getElementById('hMsg'), b = document.getElementById('hImport');
+    b.disabled = true; m.textContent = 'Lecture du fichier…';
+    try {
+      var rep = await fetch(BASE_URL + 'historique.json?v=' + Date.now());
+      if (!rep.ok) throw new Error('historique.json introuvable sur GitHub');
+      var h = await rep.json(), cles = Object.keys(h.mois || {});
+      for (var i = 0; i < cles.length; i++) {
+        m.textContent = 'Enregistrement dans le Shelly : ' + (i + 1) + ' / ' + cles.length + ' mois…';
+        await rpc('KVS.Set', { key: cles[i], value: JSON.stringify(h.mois[cles[i]]) });
+      }
+      var txt = cles.length + ' mois importés ✓';
+      var u = document.getElementById('jURL').value.trim(), k = document.getElementById('jKEY').value.trim();
+      if (u && k && h.jours) {
+        m.textContent = 'Envoi au Google Sheet…';
+        await fetch(u, { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({ token: k, type: 'historique', jours: h.jours, mois: h.mois }) });
+        txt += ' Envoyé aussi au Google Sheet (onglet « Avant Shelly »).';
+      }
+      m.textContent = txt;
+      if (plage().gran === 'month') chargerPeriode();
+    } catch (err) { m.textContent = 'Erreur : ' + err.message; }
+    finally { b.disabled = false; }
   }
 
   /* ---------- Appareils récurrents : détection des cycles de puissance ---------- */
